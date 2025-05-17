@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>Простая онлайн нарды</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  #board { display: flex; flex-direction: column; align-items: center; }
+  #status { margin-bottom: 10px; }
+  #logs { max-height: 200px; overflow-y: auto; border: 1px solid #ccc; padding: 5px; width: 600px; }
+  #dice { margin: 10px; font-size: 24px; }
+  button { margin: 5px; padding: 10px; }
+  .player { font-weight: bold; }
+  .move { cursor: pointer; margin: 2px; padding: 2px 5px; border: 1px solid #ccc; display: inline-block; }
+</style>
+</head>
+<body>
+
+<h1>Простая игра нарды</h1>
+
+<div id="status">Статус: <span id="connectionStatus">Ожидание соединения...</span></div>
+
+<div>
+  <button id="createBtn">Создать игру (хост)</button>
+  <button id="joinBtn">Присоединиться к игре (клиент)</button>
+</div>
+
+<div id="offerSection" style="display:none;">
+  <h3>Отправьте ссылку вашему другу:</h3>
+  <textarea id="offerLink" rows="3" cols="60" readonly></textarea>
+  <button id="copyOffer">Копировать ссылку</button>
+</div>
+
+<div id="answerSection" style="display:none;">
+  <h3>Вставьте ссылку от друга:</h3>
+  <textarea id="answerLink" rows="3" cols="60"></textarea>
+  <button id="connectBtn">Подключиться</button>
+</div>
+
+<div id="game" style="display:none;">
+  <div id="playerInfo"></div>
+  <div id="dice"></div>
+  <button id="rollBtn">Бросить кости</button>
+  <div id="logs"></div>
+</div>
+
+<script>
+let peerConnection = null;
+let dataChannel = null;
+let isHost = false;
+let isConnected = false;
+let myTurn = false;
+let gameState = {
+  // Пример простого состояния: позиции шашек
+  // Для упрощения - 24 пункта на доске
+  points: Array(24).fill(0),
+  bar: { white: 0, black: 0 }, // шашки на "баре"
+  borneOff: { white: 0, black: 0 }
+};
+let localColor = null; // 'white' или 'black'
+let diceValues = [];
+
+const statusSpan = document.getElementById('connectionStatus');
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const offerLinkTextarea = document.getElementById('offerLink');
+const copyOfferBtn = document.getElementById('copyOffer');
+const answerSection = document.getElementById('answerSection');
+const offerSection = document.getElementById('offerSection');
+const answerLinkTextarea = document.getElementById('answerLink');
+const connectBtn = document.getElementById('connectBtn');
+
+const gameDiv = document.getElementById('game');
+const diceDiv = document.getElementById('dice');
+const rollBtn = document.getElementById('rollBtn');
+const logsDiv = document.getElementById('logs');
+const playerInfoDiv = document.getElementById('playerInfo');
+
+const localStorageKey = 'nards-signaling';
+
+function log(message) {
+  const p = document.createElement('div');
+  p.textContent = message;
+  logsDiv.appendChild(p);
+  logsDiv.scrollTop = logsDiv.scrollHeight;
+}
+
+// Создаёт или присоединяется к соединению
+createBtn.onclick = () => {
+  isHost = true;
+  startPeer(true);
+};
+joinBtn.onclick = () => {
+  isHost = false;
+  startPeer(false);
+};
+
+function startPeer(isOfferer) {
+  peerConnection = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+
+  peerConnection.onicecandidate = event => {
+    if (event.candidate) {
+      // Можно добавить обмен кандидатами через сервер или вручную
+      // Для простоты используем обмен через текст
+      saveSignaling();
+    }
+  };
+
+  if (isOfferer) {
+    dataChannel = peerConnection.createDataChannel('nards');
+    setupDataChannel();
+    peerConnection.createOffer().then(offer => {
+      return peerConnection.setLocalDescription(offer);
+    }).then(() => {
+      saveSignaling();
+    });
+  } else {
+    peerConnection.ondatachannel = event => {
+      dataChannel = event.channel;
+      setupDataChannel();
+    };
+  }
+
+  // Попытка восстановления сигнальных данных
+  loadSignaling();
+
+  // Отобразить ссылки
+  if (isOfferer) {
+    statusSpan.textContent = 'Создано. Отправьте ссылку другу.';
+    offerSection.style.display = 'block';
+    answerSection.style.display = 'none';
+    document.getElementById('offerLink').value = generateLink();
+  } else {
+    statusSpan.textContent = 'Ожидание предложения...';
+    offerSection.style.display = 'none';
+    answerSection.style.display = 'block';
+  }
+}
+
+function setupDataChannel() {
+  dataChannel.onopen = () => {
+    log('Соединение установлено.');
+    isConnected = true;
+    startGame();
+  };
+  dataChannel.onmessage = event => {
+    handleMessage(event.data);
+  };
+}
+
+function handleMessage(data) {
+  const msg = JSON.parse(data);
+  if (msg.type === 'state') {
+    // Обновляем состояние
+    gameState = msg.state;
+    updateBoard();
+    log('Получено состояние игры.');
+    // Определяем чей ход
+    myTurn = (msg.nextPlayer === localColor);
+    updateTurn();
+  } else if (msg.type === 'move') {
+    // Обработка хода
+    gameState = msg.state;
+    updateBoard();
+    log(`Игрок ${msg.player} сделал ход.`);
+    myTurn = (msg.nextPlayer === localColor);
+    updateTurn();
+  } else if (msg.type === 'dice') {
+    diceValues = msg.values;
+    showDice();
+    log(`Кости: ${diceValues.join(', ')}`);
+  }
+}
+
+function sendMessage(msg) {
+  if (dataChannel && dataChannel.readyState === 'open') {
+    dataChannel.send(JSON.stringify(msg));
+  }
+}
+
+function saveSignaling() {
+  if (peerConnection) {
+    const signaling = peerConnection.localDescription || {};
+    localStorage.setItem(localStorageKey, JSON.stringify(signaling));
+  }
+}
+
+function loadSignaling() {
+  const signalingStr = localStorage.getItem(localStorageKey);
+  if (signalingStr) {
+    const signaling = JSON.parse(signalingStr);
+    if (signaling.type) {
+      peerConnection.setRemoteDescription(signaling).then(() => {
+        if (signaling.type === 'offer') {
+          return peerConnection.createAnswer();
+        }
+      }).then(answer => {
+        if (answer) {
+          return peerConnection.setLocalDescription(answer);
+        }
+      }).then(() => {
+        saveSignaling();
+      });
+    }
+  }
+}
+
+function generateLink() {
+  const desc = peerConnection.localDescription || {};
+  const url = new URL(window.location.href);
+  url.searchParams.set('signal', JSON.stringify(desc));
+  return url.toString();
+}
+
+// Обработка URL с сигнальными данными
+window.onload = () => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('signal')) {
+    const signalStr = params.get('signal');
+    try {
+      const desc = JSON.parse(signalStr);
+      peerConnection = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      peerConnection.onicecandidate = event => {
+        if (event.candidate) {
+          saveSignaling();
+        }
+      };
+      peerConnection.setRemoteDescription(desc).then(() => {
+        if (desc.type === 'offer') {
+          return peerConnection.createAnswer();
+        }
+      }).then(answer => {
+        if (answer) {
+          return peerConnection.setLocalDescription(answer);
+        }
+      }).then(() => {
+        saveSignaling();
+      });
+      if (desc.type === 'offer') {
+        isHost = false;
+        dataChannel = peerConnection.createDataChannel('nards');
+        setupDataChannel();
+      } else {
+        peerConnection.ondatachannel = event => {
+          dataChannel = event.channel;
+          setupDataChannel();
+        };
+      }
+      document.getElementById('connectionStatus').textContent = 'Подключено!';
+      startGame();
+    } catch(e) {
+      console.error('Ошибка парсинга сигнала:', e);
+    }
+  }
+};
+
+// Инициализация игры
+function startGame() {
+  document.getElementById('game').style.display = 'block';
+  // Назначим цвета
+  localColor = isHost ? 'white' : 'black';
+  playerInfoDiv.textContent = `Ваш цвет: ${localColor}`;
+  // Инициализация доски
+  initBoard();
+  updateBoard();
+  // Если хост, начинаем первым
+  if (isHost) {
+    myTurn = true;
+    updateTurn();
+  }
+}
+
+function initBoard() {
+  // Простая инициализация
+  // 2 белых на пунктах 1 и 12
+  // 2 черных на пунктах 24 и 13
+  for (let i=0; i<24; i++) {
+    gameState.points[i] = 0;
+  }
+  gameState.points[0] = 2; // белые
+  gameState.points[23] = -2; // черные
+  gameState.bar.white = 0;
+  gameState.bar.black = 0;
+  gameState.borneOff.white = 0;
+  gameState.borneOff.black = 0;
+}
+
+function updateBoard() {
+  // Обновляем визуально доску
+  // Для простоты - выводим состояние массива points
+  logsDiv.innerHTML = '';
+  logsDiv.innerHTML += '<b>Пункты:</b><br>';
+  gameState.points.forEach((val, i) => {
+    logsDiv.innerHTML += `Пункт ${i+1}: ${val} шашек<br>`;
+  });
+  // Можно добавить интерактивность для перемещения
+}
+
+function updateTurn() {
+  if (myTurn) {
+    statusSpan.textContent = 'Ваш ход.';
+    rollBtn.disabled = false;
+  } else {
+    statusSpan.textContent = 'Ожидание хода другого игрока.';
+    rollBtn.disabled = true;
+  }
+}
+
+document.getElementById('copyOffer').onclick = () => {
+  offerLinkTextarea.select();
+  document.execCommand('copy');
+  alert('Ссылка скопирована!');
+};
+
+document.getElementById('connectBtn').onclick = () => {
+  const url = answerLinkTextarea.value.trim();
+  if (url) {
+    window.location.href = url;
+  }
+};
+
+document.getElementById('rollBtn').onclick = () => {
+  if (!myTurn) return;
+  // Бросаем кости
+  diceValues = [Math.ceil(Math.random()*6), Math.ceil(Math.random()*6)];
+  showDice();
+  sendMessage({type:'dice', values:diceValues});
+  // Далее можно реализовать выбор ходов
+  // Для упрощения - просто передаём ход
+  // В реальности нужно реализовать перемещение шашек
+  // Для этого можно реализовать интерфейс, но пропустим
+  // После хода передаём состояние
+  // Для примера - просто меняем игрока
+  myTurn = false;
+  updateTurn();
+  // Передаём состояние
+  sendMessage({type:'state', state:gameState, nextPlayer: (localColor==='white')?'black':'white'});
+};
+</script>
+
+</body>
+</html>
